@@ -241,12 +241,14 @@ jobs:
           apk="Readest_${version}_universal.apk"
           apk_src=$(ls src-tauri/gen/android/app/build/outputs/apk/*/release/*.apk | head -n1)
           cp "$apk_src" "$apk"
-          # `signer sign` reads the key from the env but then still asks for a
-          # password when TAURI_SIGNING_PRIVATE_KEY_PASSWORD is absent; with no
-          # TTY that dies with "No such device or address". Handing it the key
-          # file instead skips the prompt for a passwordless key.
+          # `signer sign` refuses to run when the key arrives both as an env var
+          # and as --private-key-path, and with only the env var it tries to
+          # prompt for a password, which dies on a headless runner
+          # ("No such device or address"). Drop the env var for this one command
+          # and hand it the key file: a passwordless key then signs silently.
           printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/updater.key"
-          pnpm tauri signer sign "$apk" --private-key-path "$RUNNER_TEMP/updater.key"
+          env -u TAURI_SIGNING_PRIVATE_KEY \
+            pnpm tauri signer sign "$apk" --private-key-path "$RUNNER_TEMP/updater.key"
           ls -lh "$apk" "$apk.sig"
 
           gh release upload "${{ needs.prepare.outputs.tag }}" -R "$GITHUB_REPOSITORY" --clobber \
