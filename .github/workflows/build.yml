@@ -212,13 +212,12 @@ jobs:
           workspaces: src -> target
           key: android-arm64-cargo
 
-      - name: build, sign and publish the APK
+      - name: build and publish the APK
         working-directory: src/apps/readest-app
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
           NODE_OPTIONS: '--max-old-space-size=8192'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
@@ -241,21 +240,64 @@ jobs:
           apk="Readest_${version}_universal.apk"
           apk_src=$(ls src-tauri/gen/android/app/build/outputs/apk/*/release/*.apk | head -n1)
           cp "$apk_src" "$apk"
-          # `signer sign` refuses to run when the key arrives both as an env var
-          # and as --private-key-path, and with only the env var it tries to
-          # prompt for a password, which dies on a headless runner
-          # ("No such device or address"). Drop the env var for this one command
-          # and hand it the key file: a passwordless key then signs silently.
-          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/updater.key"
-          env -u TAURI_SIGNING_PRIVATE_KEY \
-            pnpm tauri signer sign "$apk" --private-key-path "$RUNNER_TEMP/updater.key"
-          ls -lh "$apk" "$apk.sig"
+          ls -lh "$apk"
 
-          gh release upload "${{ needs.prepare.outputs.tag }}" -R "$GITHUB_REPOSITORY" --clobber \
-            "$apk" "$apk.sig"
+          gh release upload "${{ needs.prepare.outputs.tag }}" -R "$GITHUB_REPOSITORY" --clobber "$apk"
+
+  # Split out from the build on purpose: signing a 56 MB artifact should not
+  # cost another 25 minute compile when the command line is wrong.
+  sign-android:
+    needs: [prepare, android]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.android.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: sign the APK with the updater key
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -uo pipefail
+          mkdir -p apk && cd apk
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" \
+            --pattern "Readest_${VERSION}_universal.apk" --clobber
+          apk=$(ls ./*.apk | head -n1)
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/updater.key"
+          rm -f "$apk.sig"
+          signed=0
+          sum() { ls -l "$apk.sig" && echo "signed"; }
+
+          echo "::group::attempt 1 - key path through the env var"
+          if env -u TAURI_SIGNING_PRIVATE_KEY \
+               TAURI_SIGNING_PRIVATE_KEY_PATH="$RUNNER_TEMP/updater.key" \
+               npx -y @tauri-apps/cli@2 signer sign "$apk"; then signed=1; fi
+          echo "::endgroup::"
+
+          if [ "$signed" = 0 ]; then
+            echo "::group::attempt 2 - --private-key-path argument"
+            if env -u TAURI_SIGNING_PRIVATE_KEY \
+                 npx -y @tauri-apps/cli@2 signer sign "$apk" \
+                 --private-key-path "$RUNNER_TEMP/updater.key"; then signed=1; fi
+            echo "::endgroup::"
+          fi
+
+          if [ "$signed" = 0 ]; then
+            echo "::group::attempt 3 - key from the env, empty password"
+            if TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+                 npx -y @tauri-apps/cli@2 signer sign "$apk"; then signed=1; fi
+            echo "::endgroup::"
+          fi
+
+          if [ "$signed" = 0 ] || [ ! -f "$apk.sig" ]; then
+            echo "::error::could not sign the APK"
+            exit 1
+          fi
+          sum
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "$apk.sig"
 
   manifest:
-    needs: [prepare, windows, android]
+    needs: [prepare, windows, android, sign-android]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
