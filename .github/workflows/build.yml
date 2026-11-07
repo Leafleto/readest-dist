@@ -1,0 +1,269 @@
+name: Build Readest (personal)
+
+# Builds the personal Readest build from the private source repo and publishes
+# signed installers plus the update manifest (`latest.json`) to this repo's
+# releases. Public repo on purpose: the updater inside the app has to fetch
+# latest.json and the artifacts anonymously, and a private repo cannot serve
+# those without a token.
+#
+# Source repo: https://github.com/Leafleto/readest-mod (private, read via a
+# read-only deploy key).
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch or tag of the private source repo to build'
+        required: false
+        default: 'main'
+      version_override:
+        description: 'Force the version number (leave empty to use package.json)'
+        required: false
+        default: ''
+      build_windows:
+        description: 'Build the Windows installer'
+        type: boolean
+        default: true
+      build_android:
+        description: 'Build the Android APK'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: read the version from the source repo
+        id: meta
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 --branch "${{ inputs.source_ref }}" \
+            git@github.com:Leafleto/readest-mod.git src
+          version=$(node -p "require('./src/apps/readest-app/package.json').version")
+          if [ -n "${{ inputs.version_override }}" ]; then
+            version="${{ inputs.version_override }}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version from ${{ inputs.source_ref }}"
+
+      - name: create the release if it does not exist yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          version="${{ steps.meta.outputs.version }}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists."
+            exit 0
+          fi
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --target "${{ github.ref_name }}" \
+            --title "Readest $version" \
+            --notes "Personal build of Readest $version."
+
+  windows:
+    needs: prepare
+    if: ${{ inputs.build_windows != false }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: clone the private source
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 --branch "${{ inputs.source_ref }}" \
+            git@github.com:Leafleto/readest-mod.git src
+          cd src
+          git submodule update --init --recursive
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: src/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: install dependencies
+        working-directory: src
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        working-directory: src
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src -> target
+          key: windows-x64-cargo
+
+      - name: build and sign the Windows installer
+        working-directory: src/apps/readest-app
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: publish the installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          tag="${{ needs.prepare.outputs.tag }}"
+          dir=$(dirname "$(ls src/target/*/release/bundle/nsis/*.exe | head -n1)")
+          echo "artifacts in $dir"
+          ls -lh "$dir"
+          exe=$(ls "$dir"/*.exe | head -n1)
+          if [ ! -f "${exe}.sig" ]; then
+            echo "::error::no updater signature was produced - is TAURI_SIGNING_PRIVATE_KEY set?"
+            exit 1
+          fi
+          cp "$exe" "Readest_${version}_x64-setup.exe"
+          cp "${exe}.sig" "Readest_${version}_x64-setup.exe.sig"
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber \
+            "Readest_${version}_x64-setup.exe" \
+            "Readest_${version}_x64-setup.exe.sig"
+
+  android:
+    needs: prepare
+    if: ${{ inputs.build_android != false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: clone the private source
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 --branch "${{ inputs.source_ref }}" \
+            git@github.com:Leafleto/readest-mod.git src
+          cd src
+          git submodule update --init --recursive
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: src/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: free disk space on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      /usr/local/lib/android/sdk/system-images /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        working-directory: src
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        working-directory: src
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src -> target
+          key: android-arm64-cargo
+
+      - name: build, sign and publish the APK
+        working-directory: src/apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+
+          pushd src-tauri/gen/android
+          echo "keyAlias=$ANDROID_KEY_ALIAS" > keystore.properties
+          echo "password=$ANDROID_KEY_PASSWORD" >> keystore.properties
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+          popd
+
+          pnpm tauri android build -t aarch64
+          version="${{ needs.prepare.outputs.version }}"
+          apk="Readest_${version}_universal.apk"
+          apk_src=$(ls src-tauri/gen/android/app/build/outputs/apk/*/release/*.apk | head -n1)
+          cp "$apk_src" "$apk"
+          pnpm tauri signer sign "$apk"
+          ls -lh "$apk" "$apk.sig"
+
+          gh release upload "${{ needs.prepare.outputs.tag }}" -R "$GITHUB_REPOSITORY" --clobber \
+            "$apk" "$apk.sig"
+
+  manifest:
+    needs: [prepare, windows, android]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: collect signatures and write latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dl \
+            --pattern "*.sig" --clobber || true
+          ls -l dl || true
+          node tools/make-latest-json.mjs
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber latest.json release-notes.json
